@@ -133,13 +133,13 @@ function locateTargets(platform) {
   const platforms = platform
     ? [platform]
     : ["mac-arm64", "mac-x64", "win"].filter((p) =>
-        fs.existsSync(path.join(SRC_DIR, p, "webview", "assets"))
+        fs.existsSync(path.join(SRC_DIR, p, "_asar", "webview", "assets"))
       );
 
   const targets = [];
 
   for (const plat of platforms) {
-    const assetsDir = path.join(SRC_DIR, plat, "webview", "assets");
+    const assetsDir = path.join(SRC_DIR, plat, "_asar", "webview", "assets");
     if (!fs.existsSync(assetsDir)) continue;
 
     for (const f of fs.readdirSync(assetsDir)) {

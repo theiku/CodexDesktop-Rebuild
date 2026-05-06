@@ -1,67 +1,92 @@
 #!/usr/bin/env node
 /**
- * Pre-build: Copy platform resources into flat src/ for forge.
+ * Pre-build: Repack patched ASAR, replace codex CLI, assemble for forge.
  *
- * Sources:
- *   --platform mac-arm64   src/mac-arm64/
- *   --platform mac-x64     src/mac-x64/
- *   --platform win         src/win/
- *   --platform linux-x64   src/mac-x64/ + strip macOS-only + Linux binaries
- *   --platform linux-arm64 src/mac-arm64/ + strip macOS-only + Linux binaries
+ * Flow:
+ *   1. Repack _asar/ -> app.asar (with patches applied)
+ *   2. Replace codex binary with @cometix/codex version
+ *   3. Copy everything to src/ for forge (app.asar + unpacked + resources)
+ *
+ * For Linux: strip macOS-only resources, add Linux codex from @cometix/codex
  *
  * Usage:
  *   node scripts/prepare-src.js --platform mac-arm64
+ *   node scripts/prepare-src.js --platform linux-x64
  */
 const fs = require("fs");
 const path = require("path");
+const { execSync } = require("child_process");
 
 const SRC = path.join(__dirname, "..", "src");
 const PROJECT_ROOT = path.join(__dirname, "..");
 
-// macOS-only files to strip for Linux builds
-const MACOS_ONLY = new Set([
-  "codex",              // macOS codex binary (Linux gets its own)
-  "codex_chronicle",    // macOS only tool
-  "node",              // macOS node binary
-  "node_repl",         // macOS node repl
-  "rg",                // macOS rg binary (Linux gets its own)
-  "electron.icns",     // macOS icon
-  "Assets.car",        // macOS asset catalog
-  "codexTemplate.png",
-  "codexTemplate@2x.png",
-]);
-const MACOS_ONLY_DIRS = new Set([
-  "native",            // macOS native modules (sparkle.node etc)
-]);
+const TARGET_TRIPLE_MAP = {
+  "mac-arm64": "aarch64-apple-darwin",
+  "mac-x64": "x86_64-apple-darwin",
+  "linux-x64": "x86_64-unknown-linux-musl",
+  "linux-arm64": "aarch64-unknown-linux-musl",
+  "win": "x86_64-pc-windows-msvc",
+};
 
-function copyRecursive(src, dest) {
+// macOS-only resources to strip for Linux
+const MACOS_STRIP = new Set([
+  "codex_chronicle", "node", "node_repl",
+  "electron.icns", "Assets.car",
+  "codexTemplate.png", "codexTemplate@2x.png",
+]);
+const MACOS_STRIP_DIRS = new Set(["native"]);
+
+function copyRecursive(src, dest, skipFiles, skipDirs) {
   fs.mkdirSync(dest, { recursive: true });
   let count = 0;
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
+    if (skipDirs?.has(e.name)) continue;
+    if (skipFiles?.has(e.name)) continue;
     const s = path.join(src, e.name), d = path.join(dest, e.name);
-    if (e.isDirectory()) { count += copyRecursive(s, d); }
+    if (e.isDirectory()) { count += copyRecursive(s, d, skipFiles, skipDirs); }
     else if (e.isSymbolicLink()) { /* skip */ }
     else { fs.copyFileSync(s, d); count++; }
   }
   return count;
 }
 
-function copyRecursiveFiltered(src, dest, skipFiles, skipDirs) {
-  fs.mkdirSync(dest, { recursive: true });
-  let count = 0;
-  for (const e of fs.readdirSync(src, { withFileTypes: true })) {
-    if (e.isDirectory() && skipDirs.has(e.name)) continue;
-    if (e.isFile() && skipFiles.has(e.name)) continue;
-    const s = path.join(src, e.name), d = path.join(dest, e.name);
-    if (e.isDirectory()) { count += copyRecursiveFiltered(s, d, skipFiles, skipDirs); }
-    else if (e.isSymbolicLink()) { /* skip */ }
-    else { fs.copyFileSync(s, d); count++; }
-  }
-  return count;
-}
+/**
+ * Resolve codex CLI binary from @cometix/codex.
+ * Tries node_modules first, falls back to npm pack + extract.
+ */
+function resolveCodexVendor(platform) {
+  const triple = TARGET_TRIPLE_MAP[platform];
+  if (!triple) return null;
+  const isWin = platform === "win";
+  const binName = isWin ? "codex.exe" : "codex";
 
-function clearDir(dir) {
-  if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
+  // 1. Try local node_modules
+  const localPath = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple, "codex", binName);
+  if (fs.existsSync(localPath)) return localPath;
+
+  // 2. npm pack + extract
+  console.log("   [codex] fetching @cometix/codex via npm pack...");
+  const tmpDir = path.join(require("os").tmpdir(), "cometix-codex-pack");
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
+
+  try {
+    const tgzName = execSync("npm pack @cometix/codex@latest --pack-destination " + tmpDir, {
+      cwd: tmpDir, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
+    }).trim().split("\n").pop();
+
+    const tgzPath = path.join(tmpDir, tgzName);
+    const extractDir = path.join(tmpDir, "extracted");
+    if (fs.existsSync(extractDir)) fs.rmSync(extractDir, { recursive: true });
+    fs.mkdirSync(extractDir, { recursive: true });
+    execSync(`tar xzf "${tgzPath}" -C "${extractDir}"`, { stdio: "pipe" });
+
+    const vendorPath = path.join(extractDir, "package", "vendor", triple, "codex", binName);
+    if (fs.existsSync(vendorPath)) return vendorPath;
+  } catch (e) {
+    console.log(`   [!] npm pack failed: ${e.message}`);
+  }
+
+  return null;
 }
 
 function main() {
@@ -75,79 +100,70 @@ function main() {
     process.exit(1);
   }
 
-  // Determine source directory
-  let sourceDir;
-  let isLinux = false;
-
-  switch (platform) {
-    case "mac-arm64":
-    case "mac-x64":
-    case "win":
-      sourceDir = path.join(SRC, platform);
-      break;
-    case "linux-x64":
-      sourceDir = path.join(SRC, "mac-x64");
-      isLinux = true;
-      break;
-    case "linux-arm64":
-      sourceDir = path.join(SRC, "mac-arm64");
-      isLinux = true;
-      break;
-  }
+  const isLinux = platform.startsWith("linux");
+  const sourceDir = isLinux
+    ? path.join(SRC, platform === "linux-arm64" ? "mac-arm64" : "mac-x64")
+    : path.join(SRC, platform);
 
   if (!fs.existsSync(sourceDir)) {
     console.error(`[x] Source not found: ${path.relative(PROJECT_ROOT, sourceDir)}/`);
     process.exit(1);
   }
 
+  const asarContentDir = path.join(sourceDir, "_asar");
+  if (!fs.existsSync(asarContentDir)) {
+    console.error(`[x] _asar/ not found in ${path.relative(PROJECT_ROOT, sourceDir)}/`);
+    process.exit(1);
+  }
+
   console.log(`-- prepare-src: ${platform}`);
   console.log(`   source: ${path.relative(PROJECT_ROOT, sourceDir)}/`);
 
-  // Clear flat src/ build dirs (gitignored)
-  for (const d of [".vite", "webview", "skills", "native-menu-locales", "node_modules"]) {
-    clearDir(path.join(SRC, d));
+  // 1. Repack _asar/ -> app.asar
+  const repackedAsar = path.join(sourceDir, "app.asar");
+  console.log("   [repack] _asar/ -> app.asar");
+  execSync(`npx asar pack "${asarContentDir}" "${repackedAsar}"`);
+  const asarSize = (fs.statSync(repackedAsar).size / 1048576).toFixed(1);
+  console.log(`   [ok] app.asar: ${asarSize} MB`);
+
+  // 2. Replace codex binary with @cometix/codex
+  const isWin = platform === "win";
+  const codexBinName = isWin ? "codex.exe" : "codex";
+  const vendorCodex = resolveCodexVendor(platform);
+  if (vendorCodex) {
+    const dest = path.join(sourceDir, codexBinName);
+    fs.copyFileSync(vendorCodex, dest);
+    try { fs.chmodSync(dest, 0o755); } catch {}
+    console.log(`   [codex] replaced with @cometix/codex`);
+  } else {
+    console.log(`   [!] @cometix/codex vendor not found for ${platform}, keeping upstream`);
   }
-  // Remove flat src/ loose files
+
+  // 3. Copy to flat src/ for forge
+  // Clear forge-visible dirs
+  for (const d of [".vite", "webview", "skills", "node_modules", "native-menu-locales"]) {
+    const p = path.join(SRC, d);
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true });
+  }
+  // Remove loose files in src/ (but keep platform dirs)
   for (const f of fs.readdirSync(SRC)) {
     const p = path.join(SRC, f);
     if (fs.statSync(p).isFile()) fs.unlinkSync(p);
   }
 
-  // Copy
-  let count;
-  if (isLinux) {
-    console.log("   [linux] stripping macOS-only resources");
-    count = copyRecursiveFiltered(sourceDir, SRC, MACOS_ONLY, MACOS_ONLY_DIRS);
+  // Copy ASAR content to src/ (forge needs this for package.json main entry)
+  const asarCount = copyRecursive(asarContentDir, SRC);
+  console.log(`   [copy] _asar/ -> src/ (${asarCount} files for forge)`)
 
-    // Add Linux binaries from @cometix/codex vendor
-    const vendorLinux = resolveVendorBinaries(platform === "linux-arm64" ? "aarch64-unknown-linux-musl" : "x86_64-unknown-linux-musl");
-    if (vendorLinux.codex) {
-      fs.copyFileSync(vendorLinux.codex, path.join(SRC, "codex"));
-      try { fs.chmodSync(path.join(SRC, "codex"), 0o755); } catch {}
-      console.log("   [linux] codex binary from @cometix/codex");
-      count++;
-    }
-    if (vendorLinux.rg) {
-      fs.copyFileSync(vendorLinux.rg, path.join(SRC, "rg"));
-      try { fs.chmodSync(path.join(SRC, "rg"), 0o755); } catch {}
-      console.log("   [linux] rg binary from @cometix/codex");
-      count++;
-    }
-  } else {
-    count = copyRecursive(sourceDir, SRC);
-  }
-
-  // Sync version and metadata to root package.json
-  const upstreamPkg = path.join(SRC, "package.json");
+  // 4. Sync version to root package.json
+  const upstreamPkg = path.join(asarContentDir, "package.json");
   if (fs.existsSync(upstreamPkg)) {
     const upstream = JSON.parse(fs.readFileSync(upstreamPkg, "utf-8"));
     const rootPkgPath = path.join(PROJECT_ROOT, "package.json");
     const rootPkg = JSON.parse(fs.readFileSync(rootPkgPath, "utf-8"));
-
     const oldVer = rootPkg.version;
     rootPkg.version = upstream.version || rootPkg.version;
     rootPkg.main = "src/.vite/build/bootstrap.js";
-
     for (const key of [
       "codexBuildNumber", "codexBuildFlavor",
       "codexSparkleFeedUrl", "codexSparklePublicKey",
@@ -156,22 +172,11 @@ function main() {
     ]) {
       if (upstream[key]) rootPkg[key] = upstream[key];
     }
-
     fs.writeFileSync(rootPkgPath, JSON.stringify(rootPkg, null, 2) + "\n");
     console.log(`   version: ${oldVer} -> ${rootPkg.version}`);
   }
 
-  console.log(`   [ok] ${count} files -> src/`);
-}
-
-function resolveVendorBinaries(triple) {
-  const vendorBase = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple);
-  const result = {};
-  const codexPath = path.join(vendorBase, "codex", "codex");
-  if (fs.existsSync(codexPath)) result.codex = codexPath;
-  const rgPath = path.join(vendorBase, "path", "rg");
-  if (fs.existsSync(rgPath)) result.rg = rgPath;
-  return result;
+  console.log(`   [ok] src/ ready for ${platform} build`);
 }
 
 main();

@@ -21,11 +21,11 @@ const PROJECT_ROOT = path.join(__dirname, "..");
  */
 function locateBundles({ dir, pattern, platform }) {
   const dirMap = {
-    build: (plat) => path.join(SRC_DIR, plat, ".vite", "build"),
-    assets: (plat) => path.join(SRC_DIR, plat, "webview", "assets"),
+    build: (plat) => path.join(SRC_DIR, plat, "_asar", ".vite", "build"),
+    assets: (plat) => path.join(SRC_DIR, plat, "_asar", "webview", "assets"),
   };
 
-  // Legacy fallback paths (flat src/ without platform subdirs)
+  // Legacy fallback paths (flat src/ without _asar subdirs)
   const legacyMap = {
     build: path.join(SRC_DIR, ".vite", "build"),
     assets: path.join(SRC_DIR, "webview", "assets"),

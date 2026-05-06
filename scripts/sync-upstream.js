@@ -2,20 +2,18 @@
 /**
  * sync-upstream.js — Extract full upstream Codex resources
  *
- * Downloads official builds, extracts everything from Resources directory.
- * ASAR is extracted (for patching), all other files kept as-is.
- *
- * Output:
- *   src/mac-arm64/   Full Resources/ from macOS arm64 Sparkle ZIP
- *   src/mac-x64/     Full Resources/ from macOS x64 Sparkle ZIP
- *   src/win/          Full resources/ from Windows MSIX
+ * Output structure per platform:
+ *   src/{platform}/
+ *     _asar/              Extracted app.asar content (patch target)
+ *     app.asar.unpacked/  Native modules (kept as-is from upstream)
+ *     codex|codex.exe     CLI binary (will be replaced by @cometix/codex)
+ *     rg|rg.exe           ripgrep binary (kept from upstream)
+ *     plugins/            Bundled plugins
+ *     native/             Platform native modules
+ *     ...                 All other upstream resources
  *
  * Usage:
- *   node scripts/sync-upstream.js                 # Sync if new version
- *   node scripts/sync-upstream.js --force         # Force re-sync
- *   node scripts/sync-upstream.js --check-only    # Check versions only
- *   node scripts/sync-upstream.js --skip-mac      # Skip macOS
- *   node scripts/sync-upstream.js --skip-win      # Skip Windows
+ *   node scripts/sync-upstream.js [--force] [--skip-mac] [--skip-win]
  */
 
 const https = require("https");
@@ -25,7 +23,7 @@ const fs = require("fs");
 const path = require("path");
 const { execSync } = require("child_process");
 
-// ─── TLS certs for MS delivery CDN ──────────────────────────────
+// TLS certs for MS delivery CDN
 const certsDir = path.join(__dirname, "certs");
 const extraCAs = [...tls.rootCertificates];
 for (const f of ["ms-root-ca.pem", "ms-update-ca.pem"]) {
@@ -34,7 +32,6 @@ for (const f of ["ms-root-ca.pem", "ms-update-ca.pem"]) {
 }
 https.globalAgent.options.ca = extraCAs;
 
-// ─── Constants ──────────────────────────────────────────────────
 const PROJECT_ROOT = path.resolve(__dirname, "..");
 const SRC_DIR = path.join(PROJECT_ROOT, "src");
 const TEMP_DIR = path.join(require("os").tmpdir(), "codex-sync");
@@ -43,7 +40,6 @@ const VERSION_FILE = path.join(__dirname, ".versions.json");
 const APPCAST_ARM64 = "https://persistent.oaistatic.com/codex-app-prod/appcast.xml";
 const APPCAST_X64 = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
 
-// ─── Args ───────────────────────────────────────────────────────
 const args = process.argv.slice(2);
 const FORCE = args.includes("--force");
 const CHECK_ONLY = args.includes("--check-only");
@@ -71,13 +67,11 @@ function curlDownload(url, dest, label) {
 }
 
 function extract7z(archive, dest) {
-  // Try 7zz then 7z — tolerate CRC warnings (Sparkle/MSIX quirks)
   for (const bin of ["7zz", "7z"]) {
     try {
       execSync(`${bin} x -y -o"${dest}" "${archive}"`, { stdio: "pipe" });
       return;
     } catch {
-      // Check if extraction succeeded despite error
       if (fs.readdirSync(dest).length > 0) return;
     }
   }
@@ -99,7 +93,7 @@ function copyRecursive(src, dest) {
   for (const e of fs.readdirSync(src, { withFileTypes: true })) {
     const s = path.join(src, e.name), d = path.join(dest, e.name);
     if (e.isDirectory()) { count += copyRecursive(s, d); }
-    else if (e.isSymbolicLink()) { /* skip symlinks — macOS framework links */ }
+    else if (e.isSymbolicLink()) { /* skip */ }
     else { fs.copyFileSync(s, d); count++; }
   }
   return count;
@@ -108,6 +102,15 @@ function copyRecursive(src, dest) {
 function clearDir(dir) {
   if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
   fs.mkdirSync(dir, { recursive: true });
+}
+
+function countFiles(dir) {
+  let n = 0;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (e.isDirectory()) n += countFiles(path.join(dir, e.name));
+    else n++;
+  }
+  return n;
 }
 
 // ─── Version detection ──────────────────────────────────────────
@@ -142,7 +145,7 @@ async function getWindowsVersion() {
   return { version: verMatch?.[1] || "unknown", url, packageName: pkg.name };
 }
 
-// ─── Extract macOS platform ─────────────────────────────────────
+// ─── Extract macOS ──────────────────────────────────────────────
 
 async function syncMac(variant, appcastUrl, destDir) {
   const label = `macOS-${variant}`;
@@ -154,63 +157,24 @@ async function syncMac(variant, appcastUrl, destDir) {
   const zipPath = path.join(TEMP_DIR, `Codex-${variant}-${info.version}.zip`);
   const extractDir = path.join(TEMP_DIR, `${variant}-extract`);
 
-  // Download
   if (!fs.existsSync(zipPath)) {
     curlDownload(info.url, zipPath, label);
   } else {
     console.log(`   [cache] ${zipPath}`);
   }
 
-  // Extract ZIP
   console.log("   [unzip]");
   clearDir(extractDir);
   extract7z(zipPath, extractDir);
 
-  // Find Resources dir
   const resourcesDir = findResourcesDir(extractDir);
   if (!resourcesDir) throw new Error(`${label}: Resources directory not found`);
 
-  // Find and extract ASAR
-  const asarPath = path.join(resourcesDir, "app.asar");
-  if (!fs.existsSync(asarPath)) throw new Error(`${label}: app.asar not found`);
-
-  console.log("   [asar extract]");
-  const asarTmp = path.join(TEMP_DIR, `${variant}-asar`);
-  clearDir(asarTmp);
-  execSync(`npx asar extract "${asarPath}" "${asarTmp}"`);
-
-  // Assemble output: ASAR content + all other Resources files
-  console.log(`   [assemble] -> ${path.relative(PROJECT_ROOT, destDir)}/`);
-  clearDir(destDir);
-
-  // 1. Copy extracted ASAR content (JS code for patching)
-  copyRecursive(asarTmp, destDir);
-
-  // 2. Copy all non-ASAR resources from Resources/ (binaries, plugins, etc.)
-  for (const e of fs.readdirSync(resourcesDir, { withFileTypes: true })) {
-    if (e.name === "app.asar" || e.name === "app.asar.unpacked") continue;
-    if (e.name.endsWith(".lproj")) continue; // locale bundles (handled by Electron)
-    const s = path.join(resourcesDir, e.name);
-    const d = path.join(destDir, e.name);
-    if (e.isDirectory()) {
-      copyRecursive(s, d);
-    } else if (!e.isSymbolicLink()) {
-      fs.copyFileSync(s, d);
-    }
-  }
-
-  const fileCount = countFiles(destDir);
-  console.log(`   [ok] ${fileCount} files`);
+  assembleOutput(resourcesDir, destDir, label);
   return info;
 }
 
-function findResourcesDir(extractDir) {
-  // macOS: Codex.app/Contents/Resources/
-  const appDir = findFile(extractDir, "app.asar");
-  return appDir ? path.dirname(appDir) : null;
-}
-
-// ─── Extract Windows platform ───────────────────────────────────
+// ─── Extract Windows ────────────────────────────────────────────
 
 async function syncWin(destDir) {
   console.log("\n-- Windows");
@@ -221,74 +185,76 @@ async function syncWin(destDir) {
   const msixPath = path.join(TEMP_DIR, info.packageName || `codex-win-${info.version}.msix`);
   const extractDir = path.join(TEMP_DIR, "win-extract");
 
-  // Download
   if (!fs.existsSync(msixPath)) {
     curlDownload(info.url, msixPath, "Windows MSIX");
   } else {
     console.log(`   [cache] ${msixPath}`);
   }
 
-  // Extract MSIX
   console.log("   [unzip]");
   clearDir(extractDir);
-  extract7z(msixPath, extractDir);
+  for (const bin of ["7zz", "7z"]) {
+    try { execSync(`${bin} x -y -o"${extractDir}" "${msixPath}"`, { stdio: "pipe" }); break; }
+    catch { if (fs.readdirSync(extractDir).length > 0) break; }
+  }
 
-  // Find resources dir (MSIX: app/resources/)
   const resourcesDir = path.join(extractDir, "app", "resources");
   if (!fs.existsSync(resourcesDir)) {
-    // Try alternative paths
-    const altAsar = findFile(extractDir, "app.asar");
-    if (!altAsar) throw new Error("Windows: resources dir not found");
-    throw new Error(`Windows: unexpected structure, app.asar at ${altAsar}`);
+    const alt = findFile(extractDir, "app.asar");
+    throw new Error(`Windows: resources dir not found${alt ? `, app.asar at ${alt}` : ""}`);
   }
 
-  const asarPath = path.join(resourcesDir, "app.asar");
-  if (!fs.existsSync(asarPath)) throw new Error("Windows: app.asar not found");
-
-  console.log("   [asar extract]");
-  const asarTmp = path.join(TEMP_DIR, "win-asar");
-  clearDir(asarTmp);
-  execSync(`npx asar extract "${asarPath}" "${asarTmp}"`);
-
-  // Assemble output
-  console.log(`   [assemble] -> ${path.relative(PROJECT_ROOT, destDir)}/`);
-  clearDir(destDir);
-
-  // 1. ASAR content
-  copyRecursive(asarTmp, destDir);
-
-  // 2. All non-ASAR resources
-  for (const e of fs.readdirSync(resourcesDir, { withFileTypes: true })) {
-    if (e.name === "app.asar" || e.name === "app.asar.unpacked") continue;
-    const s = path.join(resourcesDir, e.name);
-    const d = path.join(destDir, e.name);
-    if (e.isDirectory()) {
-      copyRecursive(s, d);
-    } else if (!e.isSymbolicLink()) {
-      fs.copyFileSync(s, d);
-    }
-  }
-
-  const fileCount = countFiles(destDir);
-  console.log(`   [ok] ${fileCount} files`);
+  assembleOutput(resourcesDir, destDir, "Windows");
   return info;
 }
 
-// ─── Utilities ──────────────────────────────────────────────────
+// ─── Assemble output ────────────────────────────────────────────
 
-function countFiles(dir) {
-  let n = 0;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (e.isDirectory()) n += countFiles(path.join(dir, e.name));
-    else n++;
+function assembleOutput(resourcesDir, destDir, label) {
+  const asarPath = path.join(resourcesDir, "app.asar");
+  if (!fs.existsSync(asarPath)) throw new Error(`${label}: app.asar not found`);
+
+  console.log(`   [assemble] -> ${path.relative(PROJECT_ROOT, destDir)}/`);
+  clearDir(destDir);
+
+  // 1. Extract app.asar → _asar/ (for patching)
+  const asarDest = path.join(destDir, "_asar");
+  console.log("   [asar extract] -> _asar/");
+  execSync(`npx asar extract "${asarPath}" "${asarDest}"`);
+
+  // 2. Copy app.asar.unpacked/ as-is (native modules)
+  const unpackedSrc = path.join(resourcesDir, "app.asar.unpacked");
+  if (fs.existsSync(unpackedSrc)) {
+    const n = copyRecursive(unpackedSrc, path.join(destDir, "app.asar.unpacked"));
+    console.log(`   [copy] app.asar.unpacked/ (${n} files)`);
   }
-  return n;
+
+  // 3. Copy all other resources (binaries, plugins, native, etc.)
+  let extraCount = 0;
+  for (const e of fs.readdirSync(resourcesDir, { withFileTypes: true })) {
+    if (e.name === "app.asar" || e.name === "app.asar.unpacked") continue;
+    if (e.name.endsWith(".lproj")) continue;
+    const s = path.join(resourcesDir, e.name);
+    const d = path.join(destDir, e.name);
+    if (e.isDirectory()) { extraCount += copyRecursive(s, d); }
+    else if (!e.isSymbolicLink()) { fs.copyFileSync(s, d); extraCount++; }
+  }
+  console.log(`   [copy] ${extraCount} extra resource files`);
+
+  const total = countFiles(destDir);
+  console.log(`   [ok] ${total} files total`);
 }
+
+function findResourcesDir(extractDir) {
+  const appDir = findFile(extractDir, "app.asar");
+  return appDir ? path.dirname(appDir) : null;
+}
+
+// ─── Version state ──────────────────────────────────────────────
 
 function loadVersions() {
   try { return JSON.parse(fs.readFileSync(VERSION_FILE, "utf-8")); } catch { return {}; }
 }
-
 function saveVersions(v) {
   fs.writeFileSync(VERSION_FILE, JSON.stringify(v, null, 2) + "\n");
 }
@@ -299,47 +265,58 @@ async function main() {
   console.log("== Codex upstream sync ==\n");
   fs.mkdirSync(TEMP_DIR, { recursive: true });
 
-  const saved = loadVersions();
   const results = {};
 
-  // macOS arm64
+  // Detect versions
   if (!SKIP_MAC) {
     try {
-      const info = await syncMac("arm64", APPCAST_ARM64, path.join(SRC_DIR, "mac-arm64"));
-      results["mac-arm64"] = info;
-    } catch (e) {
-      console.error(`   [x] mac-arm64: ${e.message}`);
-    }
+      const arm64Info = await getAppcastVersion(APPCAST_ARM64);
+      console.log(`\n   mac-arm64: ${arm64Info.version} (build ${arm64Info.build})`);
+      results["mac-arm64"] = arm64Info;
+    } catch (e) { console.error(`   [x] mac-arm64 check: ${e.message}`); }
 
-    // macOS x64
     try {
-      const info = await syncMac("x64", APPCAST_X64, path.join(SRC_DIR, "mac-x64"));
-      results["mac-x64"] = info;
-    } catch (e) {
-      console.error(`   [x] mac-x64: ${e.message}`);
-    }
+      const x64Info = await getAppcastVersion(APPCAST_X64);
+      console.log(`   mac-x64:   ${x64Info.version} (build ${x64Info.build})`);
+      results["mac-x64"] = x64Info;
+    } catch (e) { console.error(`   [x] mac-x64 check: ${e.message}`); }
   }
 
-  // Windows
   if (!SKIP_WIN) {
     try {
-      const info = await syncWin(path.join(SRC_DIR, "win"));
-      results.win = info;
-    } catch (e) {
-      console.error(`   [x] win: ${e.message}`);
-    }
+      const winInfo = await getWindowsVersion();
+      console.log(`   win:       ${winInfo.version}`);
+      results.win = winInfo;
+    } catch (e) { console.error(`   [x] win check: ${e.message}`); }
   }
 
-  // Save versions
-  const newSaved = { ...saved };
-  for (const [key, info] of Object.entries(results)) {
-    newSaved[key] = {
-      version: info.version,
-      build: info.build || "",
-      checkedAt: new Date().toISOString(),
-    };
+  if (CHECK_ONLY) {
+    console.log("\n== Check only, skipping download ==");
+    return;
   }
-  saveVersions(newSaved);
+
+  // Download and extract
+  if (!SKIP_MAC && results["mac-arm64"]) {
+    try {
+      results["mac-arm64"] = await syncMac("arm64", APPCAST_ARM64, path.join(SRC_DIR, "mac-arm64"));
+    } catch (e) { console.error(`   [x] mac-arm64: ${e.message}`); }
+  }
+  if (!SKIP_MAC && results["mac-x64"]) {
+    try {
+      results["mac-x64"] = await syncMac("x64", APPCAST_X64, path.join(SRC_DIR, "mac-x64"));
+    } catch (e) { console.error(`   [x] mac-x64: ${e.message}`); }
+  }
+  if (!SKIP_WIN && results.win) {
+    try {
+      results.win = await syncWin(path.join(SRC_DIR, "win"));
+    } catch (e) { console.error(`   [x] win: ${e.message}`); }
+  }
+
+  const saved = loadVersions();
+  for (const [key, info] of Object.entries(results)) {
+    saved[key] = { version: info.version, build: info.build || "", checkedAt: new Date().toISOString() };
+  }
+  saveVersions(saved);
 
   console.log("\n== Done ==");
   for (const [key, info] of Object.entries(results)) {
@@ -347,7 +324,4 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error(`\n[x] ${e.message}`);
-  process.exit(1);
-});
+main().catch((e) => { console.error(`\n[x] ${e.message}`); process.exit(1); });
