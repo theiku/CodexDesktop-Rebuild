@@ -65,12 +65,22 @@ function resolveCodexVendor(platform) {
   const localPath = path.join(PROJECT_ROOT, "node_modules", "@cometix", "codex", "vendor", triple, "codex", binName);
   if (fs.existsSync(localPath)) return localPath;
 
-  // npm pack fallback
-  console.log("   [codex] fetching via npm pack...");
+  // npm pack fallback — fetch platform-specific package
+  const PLAT_PKG_MAP = {
+    "mac-arm64": "@cometix/codex@latest-darwin-arm64",
+    "mac-x64": "@cometix/codex@latest-darwin-x64",
+    "win": "@cometix/codex@latest-win32-x64",
+    "linux-x64": "@cometix/codex@latest-linux-x64",
+    "linux-arm64": "@cometix/codex@latest-linux-arm64",
+  };
+  const platPkgSpec = PLAT_PKG_MAP[platform];
+  if (!platPkgSpec) return null;
+
+  console.log(`   [codex] fetching ${platPkgSpec} via npm pack...`);
   const tmpDir = path.join(require("os").tmpdir(), "cometix-codex-pack");
   fs.mkdirSync(tmpDir, { recursive: true });
   try {
-    const tgzName = execSync("npm pack @cometix/codex@latest --pack-destination " + tmpDir, {
+    const tgzName = execSync(`npm pack ${platPkgSpec} --pack-destination "${tmpDir}"`, {
       cwd: tmpDir, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"],
     }).trim().split("\n").pop();
     const extractDir = path.join(tmpDir, "extracted");
