@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 /**
- * sync-native-modules.js — Copy rebuilt native modules to src/node_modules/
+ * sync-native-modules.js — Align src/node_modules/ with upstream ASAR layout
  *
- * After electron-rebuild compiles native .node files for the target platform,
- * this script copies the relevant production dependencies from the project
- * root node_modules/ into src/node_modules/ so forge packs the correct
- * binaries into the ASAR.
+ * The upstream ASAR only ships a small set of unbundleable modules in
+ * node_modules/ (native addons + their deps). Everything else is Vite-bundled
+ * into .vite/build/.
  *
- * Only copies modules listed in the upstream _asar/package.json dependencies.
- * Skips macOS-only modules (objc-js) on Linux.
+ * This script:
+ *   1. Reads the actual module list from upstream _asar/node_modules/
+ *   2. For each module, copies from project node_modules/ (rebuilt for target)
+ *   3. Skips macOS-only modules (objc-js) on Linux
+ *
+ * This ensures the ASAR gets Linux-compiled .node binaries instead of
+ * macOS Mach-O ones from the upstream extract.
  *
  * Usage:
  *   node scripts/sync-native-modules.js --platform linux-x64
@@ -35,89 +39,82 @@ function copyRecursive(src, dest) {
   return count;
 }
 
+function hasNativeFiles(dir) {
+  if (!fs.existsSync(dir)) return false;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) { if (hasNativeFiles(p)) return true; }
+    else if (e.name.endsWith(".node")) return true;
+  }
+  return false;
+}
+
 function main() {
   const args = process.argv.slice(2);
   const platIdx = args.indexOf("--platform");
   const platform = platIdx !== -1 ? args[platIdx + 1] : null;
   const isLinux = platform?.startsWith("linux");
 
-  // Read upstream dependency list from _asar/package.json
+  // Determine upstream _asar/node_modules/ to get the authoritative module list
   const sourceDir = isLinux
     ? path.join(SRC, platform === "linux-arm64" ? "mac-arm64" : "mac-x64")
     : null;
 
-  let deps;
-  const asarPkg = sourceDir
-    ? path.join(sourceDir, "_asar", "package.json")
-    : path.join(SRC, "package.json");
+  const upstreamModulesDir = sourceDir
+    ? path.join(sourceDir, "_asar", "node_modules")
+    : null;
 
-  if (fs.existsSync(asarPkg)) {
-    const pkg = JSON.parse(fs.readFileSync(asarPkg, "utf-8"));
-    deps = Object.keys(pkg.dependencies || {});
-  } else {
-    console.error("[x] Cannot find upstream package.json for dependency list");
+  if (!upstreamModulesDir || !fs.existsSync(upstreamModulesDir)) {
+    console.error("[x] Cannot find upstream _asar/node_modules/");
     process.exit(1);
   }
 
-  // Filter out macOS-only modules on Linux
-  if (isLinux) {
-    deps = deps.filter((d) => !MACOS_ONLY.has(d));
-  }
+  // Read the exact module list from upstream
+  const upstreamModules = fs.readdirSync(upstreamModulesDir)
+    .filter((name) => !name.startsWith("."));
 
-  console.log(`-- sync-native-modules: ${platform || "unknown"}`);
-  console.log(`   ${deps.length} production dependencies`);
+  console.log(`-- sync-native-modules: ${platform}`);
+  console.log(`   upstream modules: ${upstreamModules.join(", ")}`);
 
+  // Clean and recreate src/node_modules/
+  if (fs.existsSync(SRC_MODULES)) fs.rmSync(SRC_MODULES, { recursive: true });
   fs.mkdirSync(SRC_MODULES, { recursive: true });
 
   let totalCopied = 0;
-  let nativeCount = 0;
 
-  for (const dep of deps) {
-    const rootDir = path.join(ROOT_MODULES, dep);
-    if (!fs.existsSync(rootDir)) {
-      // Check if it's a bundled/internal module from upstream (not in our package.json)
+  for (const mod of upstreamModules) {
+    // Skip macOS-only modules on Linux
+    if (isLinux && MACOS_ONLY.has(mod)) {
+      console.log(`   [skip] ${mod} (macOS only)`);
       continue;
     }
 
-    const destDir = path.join(SRC_MODULES, dep);
-    if (fs.existsSync(destDir)) fs.rmSync(destDir, { recursive: true });
+    // Prefer rebuilt version from project node_modules/
+    const rootDir = path.join(ROOT_MODULES, mod);
+    // Fallback to upstream _asar version (pure JS modules like tslib)
+    const upstreamDir = path.join(upstreamModulesDir, mod);
 
-    const count = copyRecursive(rootDir, destDir);
-    totalCopied += count;
+    let sourceLabel;
+    let source;
 
-    // Check if this module has native binaries
-    const hasNative = findFiles(destDir, ".node").length > 0;
-    if (hasNative) {
-      nativeCount++;
-      console.log(`   [native] ${dep} (${count} files)`);
+    if (fs.existsSync(rootDir)) {
+      source = rootDir;
+      sourceLabel = hasNativeFiles(rootDir) ? "rebuilt" : "project";
+    } else if (fs.existsSync(upstreamDir)) {
+      source = upstreamDir;
+      sourceLabel = "upstream";
+    } else {
+      console.log(`   [!] ${mod} not found in project or upstream`);
+      continue;
     }
-  }
 
-  // Also copy scoped dependency sub-trees (@sentry/*, etc.)
-  for (const dep of deps) {
-    if (!dep.startsWith("@")) continue;
-    const [scope] = dep.split("/");
-    const scopeRoot = path.join(ROOT_MODULES, scope);
-    const scopeDest = path.join(SRC_MODULES, scope);
-    if (!fs.existsSync(scopeRoot)) continue;
-    if (fs.existsSync(scopeDest)) continue; // already copied
-
-    const count = copyRecursive(scopeRoot, scopeDest);
+    const destDir = path.join(SRC_MODULES, mod);
+    const count = copyRecursive(source, destDir);
     totalCopied += count;
+    console.log(`   [${sourceLabel}] ${mod} (${count} files)`);
   }
 
-  console.log(`   [ok] ${totalCopied} files synced, ${nativeCount} native module(s)`);
-}
-
-function findFiles(dir, ext) {
-  const results = [];
-  if (!fs.existsSync(dir)) return results;
-  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-    const p = path.join(dir, e.name);
-    if (e.isDirectory()) results.push(...findFiles(p, ext));
-    else if (e.name.endsWith(ext)) results.push(p);
-  }
-  return results;
+  console.log(`   [ok] ${totalCopied} files total in src/node_modules/`);
 }
 
 main();
